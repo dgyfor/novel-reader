@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- 左侧书页阴影层 -->
+    <path
+        android:fillColor="#D9D0C1"
+        android:pathData="M53,48 C40,40 28,42 23,44 L23,77 C28,75 40,73 53,81 Z" />
+    <!-- 左侧书页高光层 -->
+    <path
+        android:fillColor="#F6F1E7"
+        android:pathData="M53,45 C40,37 28,39 23,41 L23,74 C28,72 40,70 53,78 Z" />
+
+    <!-- 右侧书页阴影层 -->
+    <path
+        android:fillColor="#C2B8A7"
+        android:pathData="M55,48 C68,40 80,42 85,44 L85,77 C80,75 68,73 55,81 Z" />
+    <!-- 右侧书页高光层 -->
+    <path
+        android:fillColor="#E8E0D5"
+        android:pathData="M55,45 C68,37 80,39 85,41 L85,74 C80,72 68,70 55,78 Z" />
+
+    <!-- 中间的书脊缝隙 -->
+    <path
+        android:fillColor="#1A1A24"
+        android:pathData="M53,45 L55,45 L55,78 L53,78 Z" />
+
+    <!-- 左侧书页上的暗纹文字线条 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#D1C7B8"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:pathData="M29,49 Q40,48 47,52 M29,56 Q40,55 47,59 M29,63 Q40,62 47,66" />
+
+    <!-- 右侧书页上的暗纹文字线条 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#BDB3A3"
+        android:strokeWidth="1.5"
+        android:strokeLineCap="round"
+        android:pathData="M79,49 Q68,48 61,52 M79,56 Q68,55 61,59 M79,63 Q68,62 61,66" />
+
+    <!-- 垂下的红色书签（使用主题色） -->
+    <path
+        android:fillColor="#E64A19"
+        android:pathData="M73,73 L73,91 L77,87 L81,91 L81,71 Z" />
+
+    <!-- 象征灵感的金色主星芒 -->
+    <path
+        android:fillColor="#FFC107"
+        android:pathData="M54,22 L56,32 L66,34 L56,36 L54,46 L52,36 L42,34 L52,32 Z" />
+
+    <!-- 主星芒旁边的小星芒 -->
+    <path
+        android:fillColor="#FFCA28"
+        android:pathData="M65,25 L66,28 L69,29 L66,30 L65,33 L64,30 L61,29 L64,28 Z" />
+    <path
+        android:fillColor="#FFCA28"
+        android:pathData="M43,29 L44,31 L46,32 L44,33 L43,35 L42,33 L40,32 L42,31 Z" />
+        
+</vector>

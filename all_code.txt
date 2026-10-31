@@ -1,0 +1,1153 @@
+﻿
+
+==================== 文件名：EditorActivity.kt ====================
+package com.example.novel
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.Context
+import android.graphics.Color
+import android.graphics.Typeface
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.Editable
+import android.text.InputType
+import android.text.Spannable
+import android.text.SpannableString
+import android.text.StaticLayout
+import android.text.TextPaint
+import android.text.TextWatcher
+import android.text.style.BackgroundColorSpan
+import android.view.ActionMode
+import android.view.Gravity
+import android.view.Menu
+import android.view.MenuItem
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
+import android.widget.Button
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import com.example.novel.db.AnnotationDao
+import com.example.novel.db.Book
+import com.example.novel.db.BookDao
+import org.json.JSONArray
+import java.io.File
+import java.util.concurrent.Executors
+import kotlin.math.abs
+
+@Suppress("DEPRECATION", "SpellCheckingInspection") // 蹇界暐搴熷純API鍜屽崟璇嶆嫾鍐欒鍛?class EditorActivity : Activity() {
+
+    private lateinit var dao: BookDao
+    private lateinit var annDao: AnnotationDao
+    private var book: Book? = null
+
+    private var rootLayout: FrameLayout? = null
+    private var editorText: EditText? = null
+    private var wordCountView: TextView? = null
+
+    private var topBar: LinearLayout? = null
+    private var bottomBar: LinearLayout? = null
+
+    // 闃呰妯″紡鐩稿叧
+    private var readerContainer: HorizontalScrollView? = null
+    private var pageContainer: LinearLayout? = null
+    private var isReaderMode = false
+    private var btnToggleMode: Button? = null
+
+    private var currentPageIndex = 0
+
+    private var dirty = false
+    private var saveRunnable: Runnable? = null
+    private var isRenderingSpan = false
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val ioExecutor = Executors.newSingleThreadExecutor()
+
+    private lateinit var prefs: android.content.SharedPreferences
+    private var fontSize = 20f
+    private var fontFamily = "serif"
+    private var bgTheme = "paper"
+    private var lineSpacing = 1.6f
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN)
+
+        dao = BookDao(this)
+        annDao = AnnotationDao(this)
+        prefs = getSharedPreferences("reader_prefs", Context.MODE_PRIVATE)
+        loadPreferences()
+
+        val bookId = intent.getStringExtra("book_id") ?: run { finish(); return }
+        book = dao.getBook(bookId) ?: run { finish(); return }
+
+        showEditor(book!!)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        flushNow()
+    }
+
+    override fun onDestroy() {
+        saveRunnable?.let { mainHandler.removeCallbacks(it) }
+        flushNow()
+        ioExecutor.shutdown()
+        super.onDestroy()
+    }
+
+    // ================= 鐣岄潰涓绘鏋?=================
+    private fun showEditor(book: Book) {
+        rootLayout = FrameLayout(this)
+        applyTheme(rootLayout)
+
+        // 1. 缂栬緫妯″紡瑙嗗浘
+        editorText = EditText(this).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+            gravity = Gravity.TOP
+            setPadding(60, 120, 60, 120)
+            hint = "鐐瑰嚮杩欓噷寮€濮嬪垱浣?.."
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        }
+        applyFont(editorText!!)
+        applyThemeText(editorText!!)
+        setupSelectionMenu(editorText!!, 0)
+        rootLayout?.addView(editorText, FrameLayout.LayoutParams(-1, -1))
+
+        // 2. 闃呰妯″紡瑙嗗浘
+        readerContainer = HorizontalScrollView(this).apply {
+            visibility = View.GONE
+            isHorizontalScrollBarEnabled = false
+            isSmoothScrollingEnabled = false
+        }
+        pageContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+        readerContainer?.addView(pageContainer)
+        rootLayout?.addView(readerContainer, FrameLayout.LayoutParams(-1, -1))
+
+        readerContainer?.setOnTouchListener(object : View.OnTouchListener {
+            private var startX = 0f
+            private var startY = 0f
+            private var isMoving = false
+
+            override fun onTouch(v: View, event: MotionEvent): Boolean {
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        startX = event.x
+                        startY = event.y
+                        isMoving = false
+                        return false
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        if (abs(event.x - startX) > 40 || abs(event.y - startY) > 40) {
+                            isMoving = true
+                        }
+                        return false
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (!isMoving) {
+                            val w = v.width
+                            if (startX < w / 3f) jumpToPrevPage()
+                            else if (startX > w * 2 / 3f) jumpToNextPage()
+                            else toggleMenu()
+                            v.performClick() // 娑堥櫎鏃犻殰纰嶈鍛?                            return true
+                        } else {
+                            if (startX - event.x > 100) {
+                                jumpToNextPage()
+                                return true
+                            } else if (event.x - startX > 100) {
+                                jumpToPrevPage()
+                                return true
+                            }
+                        }
+                        return false
+                    }
+                }
+                return false
+            }
+        })
+
+        // 3. 椤堕儴鏍?        topBar = createTopBar(book)
+        rootLayout?.addView(topBar, FrameLayout.LayoutParams(-1, -2).apply { gravity = Gravity.TOP })
+
+        // 4. 搴曢儴鏍?        bottomBar = createBottomBar()
+        rootLayout?.addView(bottomBar, FrameLayout.LayoutParams(-1, -2).apply { gravity = Gravity.BOTTOM })
+
+        // 5. 缂栬緫妯″紡涓嬬偣鍑荤┖鐧藉尯鍛煎嚭鑿滃崟
+        editorText?.setOnClickListener { toggleMenu() }
+
+        // 鍔犺浇鍐呭
+        val content = loadContent(book)
+        editorText?.setText(content)
+        renderHighlights()
+        editorText?.setSelection(editorText!!.text.length)
+        updateWordCount(content)
+
+        // 闃叉姈淇濆瓨
+        editorText?.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                if (isRenderingSpan || isReaderMode) return
+                val text = s?.toString() ?: ""
+                dirty = true
+                scheduleSave(text)
+                updateWordCount(text)
+            }
+        })
+
+        setContentView(rootLayout)
+    }
+
+    private fun toggleMenu() {
+        val tb = topBar ?: return
+        val bb = bottomBar ?: return
+        val isVisible = tb.visibility == View.VISIBLE
+        tb.visibility = if (isVisible) View.GONE else View.VISIBLE
+        bb.visibility = if (isVisible) View.GONE else View.VISIBLE
+    }
+
+    // ================= 鏍稿績锛氱炕椤甸€昏緫 =================
+    private fun jumpToNextPage() {
+        val pc = pageContainer ?: return
+        if (currentPageIndex < pc.childCount - 1) {
+            currentPageIndex++
+            val w = readerContainer?.width ?: 0
+            readerContainer?.scrollTo(currentPageIndex * w, 0)
+        } else {
+            toast("宸茬粡鏄渶鍚庝竴椤典簡")
+        }
+    }
+
+    private fun jumpToPrevPage() {
+        if (currentPageIndex > 0) {
+            currentPageIndex--
+            val w = readerContainer?.width ?: 0
+            readerContainer?.scrollTo(currentPageIndex * w, 0)
+        } else {
+            toast("宸茬粡鏄涓€椤典簡")
+        }
+    }
+
+    // ================= 妯″紡鍒囨崲 =================
+    private fun toggleReaderMode() {
+        if (isReaderMode) {
+            isReaderMode = false
+            readerContainer?.visibility = View.GONE
+            editorText?.visibility = View.VISIBLE
+            btnToggleMode?.text = "闃呰妯″紡"
+
+            val pc = pageContainer
+            if (pc != null && currentPageIndex in 0 until pc.childCount) {
+                val tv = pc.getChildAt(currentPageIndex) as TextView
+                val offset = tv.tag as? Int ?: 0
+                editorText?.setSelection(offset.coerceIn(0, editorText?.text?.length ?: 0))
+            }
+
+            editorText?.requestFocus()
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.showSoftInput(editorText, InputMethodManager.SHOW_IMPLICIT)
+        } else {
+            isReaderMode = true
+            flushNow()
+            editorText?.clearFocus()
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.hideSoftInputFromWindow(editorText?.windowToken, 0)
+
+            editorText?.visibility = View.GONE
+            readerContainer?.visibility = View.VISIBLE
+            btnToggleMode?.text = "缂栬緫妯″紡"
+
+            renderPages()
+        }
+    }
+
+    private fun renderPages() {
+        val et = editorText ?: return
+        val pc = pageContainer ?: return
+        val text = et.text.toString()
+        pc.removeAllViews()
+        if (text.isEmpty()) return
+
+        et.post {
+            if (!isReaderMode) return@post
+
+            val paint: TextPaint = et.paint
+            val width = et.width - et.paddingLeft - et.paddingRight
+            val height = et.height - et.paddingTop - et.paddingBottom
+            if (width <= 0 || height <= 0) return@post
+
+            val staticLayout = StaticLayout.Builder.obtain(text, 0, text.length, paint, width)
+                .setLineSpacing(0f, lineSpacing).build()
+
+            val lineHeight = staticLayout.getLineBottom(0) - staticLayout.getLineTop(0)
+            if (lineHeight <= 0) return@post
+            val linesPerPage = height / lineHeight
+            if (linesPerPage <= 0) return@post
+
+            val totalLines = staticLayout.lineCount
+            val bookId = book?.id ?: return@post
+            val anns = annDao.getAnnotations(bookId)
+
+            var startLine = 0
+            while (startLine < totalLines) {
+                val endLine = minOf(startLine + linesPerPage, totalLines)
+                val startOffset = staticLayout.getLineStart(startLine)
+                val endOffset = staticLayout.getLineEnd(endLine - 1)
+
+                val pageText = text.substring(startOffset, endOffset)
+                val spannable = SpannableString(pageText)
+
+                for (ann in anns) {
+                    val s = maxOf(ann.startOffset, startOffset) - startOffset
+                    val e = minOf(ann.endOffset, endOffset) - startOffset
+                    if (s < e) {
+                        val color = if (ann.note.isNullOrEmpty()) Color.parseColor("#66FFEB3B") else Color.parseColor("#6600E676")
+                        spannable.setSpan(BackgroundColorSpan(color), s, e, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                    }
+                }
+
+                val tv = TextView(this).apply {
+                    setText(spannable) // 馃憟 淇浜?val 鎶ラ敊锛岃繖閲屽繀椤绘槸 setText
+                    setTextColor(et.currentTextColor)
+                    textSize = fontSize
+                    setLineSpacing(0f, lineSpacing)
+                    typeface = et.typeface
+                    setPadding(et.paddingLeft, et.paddingTop, et.paddingRight, et.paddingBottom)
+                    setTextIsSelectable(true)
+                    setBackgroundColor(Color.TRANSPARENT)
+                    setTag(startOffset)
+                }
+
+                setupSelectionMenu(tv, startOffset)
+                val lp = LinearLayout.LayoutParams(et.width, ViewGroup.LayoutParams.MATCH_PARENT)
+                pc.addView(tv, lp)
+                startLine = endLine
+            }
+
+            val cursorPos = et.selectionStart
+            for (i in 0 until pc.childCount) {
+                val tv = pc.getChildAt(i) as TextView
+                val pageStartOffset = tv.tag as? Int ?: 0
+                val pageEndOffset = pageStartOffset + tv.text.length
+                if (cursorPos in pageStartOffset..pageEndOffset) {
+                    currentPageIndex = i
+                    break
+                }
+            }
+            readerContainer?.scrollTo(currentPageIndex * (readerContainer?.width ?: 0), 0)
+        }
+    }
+
+    // ================= 鍒掔嚎鎷︽埅 =================
+    private fun setupSelectionMenu(view: View, pageStartOffset: Int) {
+        val callback = object : ActionMode.Callback {
+            override fun onCreateActionMode(mode: ActionMode, menu: Menu): Boolean {
+                menu.add(0, 1, 0, "鍒掗噸鐐?).setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+                menu.add(0, 2, 1, "鍐欐兂娉?).setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
+                return true
+            }
+
+            override fun onPrepareActionMode(mode: ActionMode, menu: Menu) = false
+
+            override fun onActionItemClicked(mode: ActionMode, item: MenuItem): Boolean {
+                val start = when (view) {
+                    is EditText -> view.selectionStart
+                    is TextView -> view.selectionStart + pageStartOffset
+                    else -> return false
+                }
+                val end = when (view) {
+                    is EditText -> view.selectionEnd
+                    is TextView -> view.selectionEnd + pageStartOffset
+                    else -> return false
+                }
+                if (start < 0 || end <= start) return false
+
+                val fullText = editorText?.text?.toString() ?: return false
+                if (end > fullText.length) return false
+                val quoted = fullText.substring(start, end)
+                val b = book ?: return false
+
+                return when (item.itemId) {
+                    1 -> {
+                        annDao.insert(b.id, start, end, quoted, null, "yellow")
+                        mode.finish()
+                        refreshUI()
+                        toast("宸叉坊鍔犲垝绾?)
+                        true
+                    }
+                    2 -> {
+                        val input = EditText(this@EditorActivity)
+                        input.hint = "鍐欎笅浣犵殑鎯虫硶..."
+                        input.setPadding(40, 30, 40, 30)
+                        AlertDialog.Builder(this@EditorActivity)
+                            .setTitle("鎯虫硶").setMessage("鍘熸枃锛?quoted").setView(input)
+                            .setPositiveButton("淇濆瓨") { _, _ ->
+                                annDao.insert(b.id, start, end, quoted, input.text.toString().trim(), "green")
+                                mode.finish()
+                                refreshUI()
+                                toast("鎯虫硶宸蹭繚瀛?)
+                            }.setNegativeButton("鍙栨秷", null).show()
+                        true
+                    }
+                    else -> false
+                }
+            }
+            override fun onDestroyActionMode(mode: ActionMode) {}
+        }
+
+        // 淇浜嗗啑浣欑殑绫诲瀷鍒ゆ柇璀﹀憡
+        if (view is TextView) view.customSelectionActionModeCallback = callback
+    }
+
+    private fun refreshUI() {
+        renderHighlights()
+        if (isReaderMode) renderPages()
+    }
+
+    private fun renderHighlights() {
+        val et = editorText ?: return
+        val b = book ?: return
+        isRenderingSpan = true
+        val editable = et.text
+
+        for (span in editable.getSpans(0, editable.length, BackgroundColorSpan::class.java)) {
+            editable.removeSpan(span)
+        }
+
+        for (ann in annDao.getAnnotations(b.id)) {
+            // 淇敼涓鸿寖鍥存鏌ワ紝娑堥櫎璀﹀憡
+            if (ann.startOffset in 0 until ann.endOffset && ann.endOffset <= editable.length) {
+                val color = if (ann.note.isNullOrEmpty()) Color.parseColor("#66FFEB3B") else Color.parseColor("#6600E676")
+                editable.setSpan(BackgroundColorSpan(color), ann.startOffset, ann.endOffset, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+        }
+        isRenderingSpan = false
+    }
+
+    // ================= UI 缁勪欢鐢熸垚涓庤缃?=================
+    private fun createTopBar(book: Book): LinearLayout {
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#80000000"))
+            setPadding(40, 40, 40, 40)
+            visibility = View.GONE
+        }
+        val titleView = TextView(this).apply { text = book.title; textSize = 16f; setTextColor(Color.WHITE) }
+        wordCountView = TextView(this).apply { textSize = 14f; setTextColor(Color.LTGRAY); setPadding(30, 0, 0, 0) }
+        val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        top.addView(titleView, lp)
+        top.addView(wordCountView)
+        return top
+    }
+
+    private fun createBottomBar(): LinearLayout {
+        val bottom = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(Color.parseColor("#80000000"))
+            setPadding(10, 20, 10, 20)
+            visibility = View.GONE
+        }
+        val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+        val btnBack = Button(this).apply { text = "杩斿洖"; setOnClickListener { flushNow(); finish() } }
+        btnToggleMode = Button(this).apply { text = "闃呰妯″紡"; setOnClickListener { toggleReaderMode() } }
+        val btnSetting = Button(this).apply { text = "璁剧疆"; setOnClickListener { showSettingsDialog() } }
+        val btnNotes = Button(this).apply { text = "绗旇"; setOnClickListener { showNotesList() } }
+
+        bottom.addView(btnBack, lp)
+        bottom.addView(btnToggleMode, lp)
+        bottom.addView(btnSetting, lp)
+        bottom.addView(btnNotes, lp)
+        return bottom
+    }
+
+    private fun applyTheme(root: View?) {
+        var bgColor = Color.parseColor("#F6F1E7")
+        when (bgTheme) {
+            "green" -> bgColor = Color.parseColor("#CCE8CF")
+            "dark" -> bgColor = Color.parseColor("#1A1A1A")
+            "white" -> bgColor = Color.parseColor("#FFFFFF")
+        }
+        root?.setBackgroundColor(bgColor)
+    }
+
+    private fun applyThemeText(et: EditText) {
+        var textColor = Color.parseColor("#2C2A27")
+        when (bgTheme) {
+            "green" -> textColor = Color.parseColor("#222222")
+            "dark" -> textColor = Color.parseColor("#A0A0A0")
+            "white" -> textColor = Color.parseColor("#333333")
+        }
+        et.setTextColor(textColor)
+    }
+
+    private fun applyFont(et: EditText) {
+        et.textSize = fontSize
+        et.setLineSpacing(0f, lineSpacing)
+        et.typeface = when (fontFamily) {
+            "sans-serif" -> Typeface.SANS_SERIF
+            "monospace" -> Typeface.MONOSPACE
+            else -> Typeface.SERIF
+        }
+    }
+
+    private fun loadPreferences() {
+        fontSize = prefs.getFloat("fontSize", 20f)
+        fontFamily = prefs.getString("fontFamily", "serif") ?: "serif"
+        bgTheme = prefs.getString("bgTheme", "paper") ?: "paper"
+        lineSpacing = prefs.getFloat("lineSpacing", 1.6f)
+    }
+
+    private fun savePreferences() {
+        prefs.edit().putFloat("fontSize", fontSize).putString("fontFamily", fontFamily)
+            .putString("bgTheme", bgTheme).putFloat("lineSpacing", lineSpacing).apply()
+    }
+
+    private fun showSettingsDialog() {
+        val options = arrayOf("瀛椾綋澶у皬", "瀛椾綋鏍峰紡", "闃呰鑳屾櫙", "琛岃窛璋冭妭")
+        AlertDialog.Builder(this).setTitle("闃呰璁剧疆").setItems(options) { _, which ->
+            when (which) {
+                0 -> {
+                    val values = floatArrayOf(16f, 20f, 24f, 28f, 32f)
+                    AlertDialog.Builder(this).setTitle("瀛椾綋澶у皬").setItems(arrayOf("灏?, "涓?, "澶?, "瓒呭ぇ", "鐗瑰ぇ")) { _, w ->
+                        fontSize = values[w]; savePreferences(); applyFont(editorText!!); refreshUI()
+                    }.show()
+                }
+                1 -> {
+                    val values = arrayOf("serif", "sans-serif", "monospace")
+                    AlertDialog.Builder(this).setTitle("瀛椾綋鏍峰紡").setItems(arrayOf("瀹嬩綋/琛嚎", "榛戜綋/鏃犺‖绾?, "绛夊")) { _, w ->
+                        fontFamily = values[w]; savePreferences(); applyFont(editorText!!); refreshUI()
+                    }.show()
+                }
+                2 -> {
+                    val values = arrayOf("paper", "green", "dark", "white")
+                    AlertDialog.Builder(this).setTitle("闃呰鑳屾櫙").setItems(arrayOf("缇婄毊绾?, "鎶ょ溂缁?, "澶滈棿榛?, "绾櫧")) { _, w ->
+                        bgTheme = values[w]; savePreferences(); applyTheme(rootLayout); applyThemeText(editorText!!); refreshUI()
+                    }.show()
+                }
+                3 -> {
+                    val values = floatArrayOf(1.2f, 1.6f, 2.0f, 2.4f)
+                    AlertDialog.Builder(this).setTitle("琛岄棿璺?).setItems(arrayOf("绱у噾", "閫備腑", "瀹芥澗", "鏋佸")) { _, w ->
+                        lineSpacing = values[w]; savePreferences(); applyFont(editorText!!); refreshUI()
+                    }.show()
+                }
+            }
+        }.show()
+    }
+
+    private fun showNotesList() {
+        val b = book ?: return
+        val anns = annDao.getAnnotations(b.id)
+        if (anns.isEmpty()) { toast("鏆傛棤绗旇"); return }
+        val items = anns.map {
+            if (it.note.isNullOrEmpty()) "銆愬垝绾裤€?{it.quotedText}"
+            else "銆愭兂娉曘€?{it.note}\n鍘熸枃锛?{it.quotedText}"
+        }.toTypedArray()
+
+        AlertDialog.Builder(this).setTitle("鏈功绗旇").setItems(items) { _, which ->
+            val start = anns[which].startOffset
+            if (isReaderMode) {
+                toggleReaderMode()
+            }
+            val et = editorText ?: return@setItems
+            val len = et.text?.length ?: 0
+            val safeStart = start.coerceIn(0, len)
+            et.setSelection(safeStart)
+            et.post { et.bringPointIntoView(safeStart) }
+            toast("宸插畾浣嶅埌鍘熸枃")
+        }.setNegativeButton("鍏抽棴", null).show()
+    }
+
+    // ================= 鏂囦欢淇濆瓨 =================
+    private fun textFile(bookId: String) = File(File(filesDir, "books"), "$bookId.txt")
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    private fun loadContent(book: Book): String {
+        val f = textFile(book.id)
+        if (f.exists()) return f.readText(Charsets.UTF_8)
+        f.parentFile?.mkdirs()
+        val legacyFile = File(filesDir, "novel_data.json")
+        var content = ""
+        if (legacyFile.exists()) {
+            try {
+                val legacyArr = JSONArray(legacyFile.readText(Charsets.UTF_8))
+                for (i in 0 until legacyArr.length()) {
+                    val o = legacyArr.optJSONObject(i) ?: continue
+                    if (o.optString("id") == book.id) { content = o.optString("content"); break }
+                }
+            } catch (_: Exception) {}
+        }
+        f.writeText(content, Charsets.UTF_8)
+        return content
+    }
+
+    private fun scheduleSave(content: String) {
+        saveRunnable?.let { mainHandler.removeCallbacks(it) }
+        val b = book ?: return
+        saveRunnable = Runnable {
+            ioExecutor.execute {
+                writeContent(b.id, content)
+                mainHandler.post { if (editorText?.text?.toString() == content) dirty = false }
+            }
+        }
+        mainHandler.postDelayed(saveRunnable!!, 350)
+    }
+
+    private fun writeContent(bookId: String, content: String) {
+        val f = textFile(bookId)
+        f.parentFile?.mkdirs()
+        val tmp = File(f.parentFile, "${f.name}.${System.nanoTime()}.tmp")
+        tmp.writeText(content, Charsets.UTF_8)
+        if (!tmp.renameTo(f)) { f.delete(); tmp.renameTo(f) }
+        dao.updateWordCount(bookId, content.count { !it.isWhitespace() })
+        dao.setHash(bookId, content.hashCode().toString(16))
+    }
+
+    private fun flushNow() {
+        if (!dirty) return
+        saveRunnable?.let { mainHandler.removeCallbacks(it) }
+        val b = book ?: return
+        val text = editorText?.text?.toString() ?: return
+        dirty = false
+        ioExecutor.execute { writeContent(b.id, text) }
+    }
+
+    private fun updateWordCount(text: String) {
+        wordCountView?.text = "${text.count { !it.isWhitespace() }} 瀛?
+    }
+}
+
+
+==================== 文件名：MainActivity.kt ====================
+package com.example.novel
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.content.Intent
+import android.graphics.Color
+import android.graphics.Typeface
+import android.os.Bundle
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.*
+import com.example.novel.db.Book
+import com.example.novel.db.BookDao
+import com.example.novel.db.JsonMigrator
+import org.json.JSONArray
+import java.io.File
+
+class MainActivity : Activity() {
+
+    private lateinit var dao: BookDao
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_FULLSCREEN,
+            WindowManager.LayoutParams.FLAG_FULLSCREEN
+        )
+
+        dao = BookDao(this)
+        JsonMigrator.migrateIfNeeded(this)
+        showBookshelf("闀跨瘒")
+    }
+
+    private fun showBookshelf(type: String) {
+        val isShort = type == "鐭瘒"
+        val bookList: List<Book> = dao.getAllBooks(isShort)
+
+        val mainLayout = LinearLayout(this)
+        mainLayout.orientation = LinearLayout.VERTICAL
+        mainLayout.setBackgroundColor(Color.parseColor("#F5F5F0"))
+        mainLayout.setPadding(40, 80, 40, 40)
+
+        // 鏍囬鏍忓尯锛堝悗缁湪杩欓噷鍔犫€滄寫鎴樷€濇寜閽叆鍙ｏ級
+        val titleLayout = LinearLayout(this)
+        titleLayout.orientation = LinearLayout.HORIZONTAL
+        titleLayout.gravity = Gravity.CENTER_VERTICAL
+        titleLayout.setPadding(0, 0, 0, 30)
+
+        val titleView = TextView(this)
+        titleView.text = "鎴戠殑涔︽灦"
+        titleView.textSize = 24f
+        titleView.setTypeface(null, Typeface.BOLD)
+        titleView.setTextColor(Color.parseColor("#3E2723"))
+        val lpTitle = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        titleLayout.addView(titleView, lpTitle)
+
+        val btnChallenge = Button(this)
+        btnChallenge.text = "鎸戞垬"
+        btnChallenge.setBackgroundColor(Color.parseColor("#E64A19"))
+        btnChallenge.setTextColor(Color.WHITE)
+        btnChallenge.setOnClickListener {
+            Toast.makeText(this, "鎸戞垬椤甸潰寮€鍙戜腑...", Toast.LENGTH_SHORT).show()
+        }
+        titleLayout.addView(btnChallenge)
+
+        mainLayout.addView(titleLayout)
+
+        // 闀跨煭绡囧垏鎹?        val tabLayout = LinearLayout(this)
+        tabLayout.orientation = LinearLayout.HORIZONTAL
+        tabLayout.gravity = Gravity.CENTER
+        tabLayout.setPadding(0, 0, 0, 40)
+
+        val btnLong = Button(this)
+        btnLong.text = "闀跨瘒"
+        btnLong.setBackgroundColor(if (type == "闀跨瘒") Color.parseColor("#5D4037") else Color.LTGRAY)
+        btnLong.setTextColor(Color.WHITE)
+        btnLong.setOnClickListener { showBookshelf("闀跨瘒") }
+
+        val btnShort = Button(this)
+        btnShort.text = "鐭瘒"
+        btnShort.setBackgroundColor(if (type == "鐭瘒") Color.parseColor("#5D4037") else Color.LTGRAY)
+        btnShort.setTextColor(Color.WHITE)
+        btnShort.setOnClickListener { showBookshelf("鐭瘒") }
+
+        val lpTab = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        lpTab.setMargins(10, 0, 10, 0)
+        tabLayout.addView(btnLong, lpTab)
+        tabLayout.addView(btnShort, lpTab)
+        mainLayout.addView(tabLayout)
+
+        // 涔︾睄鍒楄〃
+        val scrollView = ScrollView(this)
+        scrollView.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        val bookListLayout = LinearLayout(this)
+        bookListLayout.orientation = LinearLayout.VERTICAL
+        scrollView.addView(bookListLayout)
+        mainLayout.addView(scrollView)
+
+        for (book in bookList) {
+            val bookView = TextView(this)
+            bookView.text = book.title
+            bookView.textSize = 18f
+            bookView.setTextColor(Color.parseColor("#333333"))
+            bookView.setPadding(30, 40, 30, 40)
+            bookView.setBackgroundColor(Color.WHITE)
+            
+            // 鐐瑰嚮璺宠浆鍒?EditorActivity
+            bookView.setOnClickListener { 
+                val intent = Intent(this, EditorActivity::class.java)
+                intent.putExtra("book_id", book.id)
+                startActivity(intent)
+            }
+
+            bookView.setOnLongClickListener {
+                AlertDialog.Builder(this)
+                    .setTitle("鍒犻櫎涔︾睄")
+                    .setMessage("纭畾鍒犻櫎銆?{book.title}銆嬪悧锛?)
+                    .setPositiveButton("鍒犻櫎") { _, _ ->
+                        dao.deleteBook(book.id)
+                        File(File(filesDir, "books"), "${book.id}.txt").delete()
+                        File(File(filesDir, "books"), book.id).deleteRecursively()
+                        showBookshelf(type)
+                    }
+                    .setNegativeButton("鍙栨秷", null)
+                    .show()
+                true
+            }
+
+            val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.bottomMargin = 15
+            bookListLayout.addView(bookView, lp)
+        }
+
+        // 搴曢儴鎸夐挳锛堟柊寤?& 瀵煎叆锛?        val bottomLayout = LinearLayout(this)
+        bottomLayout.orientation = LinearLayout.HORIZONTAL
+        bottomLayout.setPadding(0, 20, 0, 0)
+
+        val btnAdd = Button(this)
+        btnAdd.text = "+ 鏂板缓涔︾睄"
+        btnAdd.setBackgroundColor(Color.parseColor("#5D4037"))
+        btnAdd.setTextColor(Color.WHITE)
+        btnAdd.setOnClickListener { createNewBook(type) }
+
+        val btnImport = Button(this)
+        btnImport.text = "瀵煎叆TXT"
+        btnImport.setBackgroundColor(Color.parseColor("#00897B"))
+        btnImport.setTextColor(Color.WHITE)
+        btnImport.setOnClickListener { 
+            Toast.makeText(this, "瀵煎叆鍔熻兘灏嗗湪涓嬩竴闃舵鎺ュ叆", Toast.LENGTH_SHORT).show() 
+        }
+
+        val lpBtn = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        lpBtn.setMargins(10, 0, 10, 0)
+        bottomLayout.addView(btnAdd, lpBtn)
+        bottomLayout.addView(btnImport, lpBtn)
+
+        mainLayout.addView(bottomLayout)
+
+        setContentView(mainLayout)
+    }
+
+    // 濡傛灉浠?EditorActivity 杩斿洖锛岄渶瑕佸埛鏂板瓧鏁扮瓑鐘舵€?    override fun onResume() {
+        super.onResume()
+        // 閲嶆柊鍒锋柊褰撳墠椤碉紙绠€鍗曞鐞嗭紝姣忔鍥炲埌涔︽灦閮介粯璁ゅ埛鏂伴暱绡囷紝鎴栬€呰浣忎笂娆＄姸鎬侊級
+        // 杩欓噷涓轰簡绠€鍗曪紝鍏堝埛鏂伴暱绡囷紝鍚庣画鍙互璁颁綇 tab
+        if (dao != null) {
+            showBookshelf("闀跨瘒") 
+        }
+    }
+
+    private fun createNewBook(type: String) {
+        val input = EditText(this)
+        input.hint = "璇疯緭鍏ヤ功鍚?
+        input.setPadding(40, 30, 40, 30)
+
+        AlertDialog.Builder(this)
+            .setTitle("鏂板缓$type")
+            .setView(input)
+            .setPositiveButton("鍒涘缓") { _, _ ->
+                val title = input.text.toString().trim()
+                if (title.isEmpty()) return@setPositiveButton
+                val isShort = type == "鐭瘒"
+                val book = dao.addBook(title, isShort)
+                if (book == null) {
+                    Toast.makeText(this, "鍒涘缓澶辫触锛屼功鍚嶅彲鑳藉凡瀛樺湪", Toast.LENGTH_SHORT).show()
+                } else {
+                    showBookshelf(type)
+                }
+            }
+            .setNegativeButton("鍙栨秷", null)
+            .show()
+    }
+}
+
+
+==================== 文件名：AnnotationDao.kt ====================
+package com.example.novel.db
+
+import android.content.ContentValues
+import android.content.Context
+import android.database.Cursor
+import java.util.UUID
+
+data class Annotation(
+    val id: String,
+    val bookId: String,
+    val startOffset: Int,
+    val endOffset: Int,
+    val quotedText: String,
+    val note: String? = null,
+    val color: String = "yellow",
+    val createdAt: Long
+)
+
+class AnnotationDao(context: Context) {
+    private val helper = DbHelper(context.applicationContext)
+    private fun db() = helper.writableDatabase
+
+    fun insert(bookId: String, start: Int, end: Int, quotedText: String, note: String? = null, color: String = "yellow"): Annotation {
+        val id = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        val cv = ContentValues().apply {
+            put("id", id)
+            put("book_id", bookId)
+            put("chapter_id", "main")
+            put("start_offset", start)
+            put("end_offset", end)
+            put("color", color)
+            put("style", "highlight")
+            put("note", note)
+            put("quoted_text", quotedText)
+            put("orphan", 0)
+            put("created_at", now)
+            put("updated_at", now)
+        }
+        db().insert(DbHelper.T_ANNOTATION, null, cv)
+        return Annotation(id, bookId, start, end, quotedText, note, color, now)
+    }
+
+    fun getAnnotations(bookId: String): List<Annotation> {
+        val list = mutableListOf<Annotation>()
+        db().query(
+            DbHelper.T_ANNOTATION, null,
+            "book_id=? AND orphan=0", arrayOf(bookId),
+            null, null, "start_offset ASC"
+        ).use { c ->
+            while (c.moveToNext()) {
+                list.add(
+                    Annotation(
+                        id = c.getString(c.getColumnIndexOrThrow("id")),
+                        bookId = c.getString(c.getColumnIndexOrThrow("book_id")),
+                        startOffset = c.getInt(c.getColumnIndexOrThrow("start_offset")),
+                        endOffset = c.getInt(c.getColumnIndexOrThrow("end_offset")),
+                        quotedText = c.getString(c.getColumnIndexOrThrow("quoted_text")),
+                        note = c.getString(c.getColumnIndexOrThrow("note")),
+                        color = c.getString(c.getColumnIndexOrThrow("color")),
+                        createdAt = c.getLong(c.getColumnIndexOrThrow("created_at"))
+                    )
+                )
+            }
+        }
+        return list
+    }
+
+    fun delete(id: String) {
+        db().delete(DbHelper.T_ANNOTATION, "id=?", arrayOf(id))
+    }
+}
+
+
+==================== 文件名：BookDao.kt ====================
+package com.example.novel.db
+
+import android.content.ContentValues
+import android.content.Context
+import android.database.Cursor
+import android.database.sqlite.SQLiteDatabase
+
+data class Book(
+    val id: String,
+    val title: String,
+    val isShort: Boolean,
+    val wordCount: Int,
+    val updatedAt: Long,
+    val contentHash: String?
+)
+
+class BookDao(context: Context) {
+    private val helper = DbHelper(context.applicationContext)
+    private fun db() = helper.writableDatabase
+
+    fun addBook(title: String, isShort: Boolean): Book? {
+        val t = title.trim()
+        if (t.isEmpty()) return null
+        val id = System.currentTimeMillis().toString()
+        val now = System.currentTimeMillis()
+        val ok = addBookWithId(id, t, isShort, 0, now, "")
+        return if (ok) Book(id, t, isShort, 0, now, "") else null
+    }
+
+    fun addBookWithId(id: String, title: String, isShort: Boolean, wordCount: Int, updatedAt: Long, hash: String?): Boolean {
+        if (id.isBlank() || title.isBlank()) return false
+        val d = db()
+        if (exists(d, id)) return false
+        val cv = ContentValues().apply {
+            put("book_id", id)
+            put("title", title)
+            put("is_short", if (isShort) 1 else 0)
+            put("content_hash", hash ?: "")
+            put("word_count", wordCount)
+            put("updated_at", updatedAt)
+        }
+        return d.insert(DbHelper.T_BOOK_META, null, cv) != -1L
+    }
+
+    fun getAllBooks(isShort: Boolean): List<Book> {
+        val list = mutableListOf<Book>()
+        db().query(DbHelper.T_BOOK_META, null, "is_short=?", arrayOf(if (isShort) "1" else "0"), null, null, "updated_at DESC").use { c -> 
+            while (c.moveToNext()) list.add(readBook(c)) 
+        }
+        return list
+    }
+
+    fun getBook(id: String): Book? {
+        db().query(DbHelper.T_BOOK_META, null, "book_id=?", arrayOf(id), null, null, null).use { c -> 
+            if (c.moveToFirst()) return readBook(c) 
+        }
+        return null
+    }
+
+    fun deleteBook(id: String) {
+        val d = db()
+        d.delete(DbHelper.T_BOOK_META, "book_id=?", arrayOf(id))
+        d.delete(DbHelper.T_ANNOTATION, "book_id=?", arrayOf(id))
+        d.delete(DbHelper.T_SESSION, "book_id=?", arrayOf(id))
+    }
+
+    fun updateWordCount(id: String, wordCount: Int) {
+        val cv = ContentValues().apply {
+            put("word_count", wordCount)
+            put("updated_at", System.currentTimeMillis())
+        }
+        db().update(DbHelper.T_BOOK_META, cv, "book_id=?", arrayOf(id))
+    }
+
+    fun setHash(id: String, hash: String) {
+        val cv = ContentValues().apply {
+            put("content_hash", hash)
+            put("updated_at", System.currentTimeMillis())
+        }
+        db().update(DbHelper.T_BOOK_META, cv, "book_id=?", arrayOf(id))
+    }
+
+    fun isEmpty(): Boolean {
+        db().query(DbHelper.T_BOOK_META, arrayOf("book_id"), null, null, null, null, null).use { c -> return !c.moveToFirst() }
+    }
+
+    private fun exists(d: SQLiteDatabase, id: String): Boolean {
+        d.query(DbHelper.T_BOOK_META, arrayOf("book_id"), "book_id=?", arrayOf(id), null, null, null).use { c -> return c.moveToFirst() }
+    }
+
+    private fun readBook(c: Cursor): Book = Book(
+        id = c.getString(c.getColumnIndexOrThrow("book_id")),
+        title = c.getString(c.getColumnIndexOrThrow("title")),
+        isShort = c.getInt(c.getColumnIndexOrThrow("is_short")) == 1,
+        wordCount = c.getInt(c.getColumnIndexOrThrow("word_count")),
+        updatedAt = c.getLong(c.getColumnIndexOrThrow("updated_at")),
+        contentHash = c.getString(c.getColumnIndexOrThrow("content_hash"))
+    )
+}
+
+
+==================== 文件名：DbHelper.kt ====================
+package com.example.novel.db
+
+import android.content.Context
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteOpenHelper
+import android.util.Log
+
+class DbHelper(context: Context) : SQLiteOpenHelper(context, DB_NAME, null, DB_VERSION) {
+
+    companion object {
+        const val DB_NAME = "novel.db"
+        const val DB_VERSION = 2 // 鍗囩骇鍒?v2锛屽姞鍏ヤ簡涔︾琛?        private const val TAG = "DbHelper"
+
+        const val T_ANNOTATION = "annotation"
+        const val T_SESSION = "reading_session"
+        const val T_BOOK_META = "book_meta"
+        const val T_BOOKMARK = "bookmark" // 鏂板锛氫功绛捐〃
+    }
+
+    override fun onCreate(db: SQLiteDatabase) {
+        // 1) 鎵规敞琛?        db.execSQL(
+            """
+            CREATE TABLE $T_ANNOTATION (
+                id            TEXT PRIMARY KEY,
+                book_id       TEXT NOT NULL,
+                chapter_id    TEXT NOT NULL DEFAULT 'main',
+                start_offset  INTEGER NOT NULL,
+                end_offset    INTEGER NOT NULL,
+                color         TEXT NOT NULL DEFAULT 'yellow',
+                style         TEXT NOT NULL DEFAULT 'highlight',
+                note          TEXT,
+                quoted_text   TEXT NOT NULL,
+                orphan        INTEGER NOT NULL DEFAULT 0,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_ann_book ON $T_ANNOTATION(book_id, start_offset)")
+
+        // 2) 闃呰鏃堕暱琛?        db.execSQL(
+            """
+            CREATE TABLE $T_SESSION (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id     TEXT NOT NULL,
+                start_time  INTEGER NOT NULL,
+                end_time    INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                date_key    TEXT NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_sess_book ON $T_SESSION(book_id, date_key)")
+
+        // 3) 涔︾睄鍏冧俊鎭〃
+        db.execSQL(
+            """
+            CREATE TABLE $T_BOOK_META (
+                book_id       TEXT PRIMARY KEY,
+                title         TEXT NOT NULL,
+                is_short      INTEGER NOT NULL DEFAULT 0,
+                content_hash  TEXT,
+                word_count    INTEGER NOT NULL DEFAULT 0,
+                updated_at    INTEGER NOT NULL,
+                progress_offset INTEGER NOT NULL DEFAULT 0
+            )
+            """.trimIndent()
+        )
+        
+        // 4) 涔︾琛?        db.execSQL(
+            """
+            CREATE TABLE $T_BOOKMARK (
+                id            TEXT PRIMARY KEY,
+                book_id       TEXT NOT NULL,
+                char_offset   INTEGER NOT NULL,
+                chapter_name  TEXT,
+                created_at    INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_mark_book ON $T_BOOKMARK(book_id, char_offset)")
+    }
+
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        // 濡傛灉浣犲凡缁忚杩?v1 鐗堟湰锛岃繖閲屼細鑷姩缁欎綘琛ヤ笂缂哄皯鐨勮〃鍜屽垪
+        if (oldVersion < 2) {
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS $T_BOOKMARK (
+                    id            TEXT PRIMARY KEY,
+                    book_id       TEXT NOT NULL,
+                    char_offset   INTEGER NOT NULL,
+                    chapter_name  TEXT,
+                    created_at    INTEGER NOT NULL
+                )
+                """.trimIndent()
+            )
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_mark_book ON $T_BOOKMARK(book_id, char_offset)")
+            
+            // 缁欎功鍏冧俊鎭〃鍔犱竴涓褰曢槄璇昏繘搴︾殑鍒?            db.execSQL("ALTER TABLE $T_BOOK_META ADD COLUMN progress_offset INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+}
+
+
+==================== 文件名：JsonMigrator.kt ====================
+package com.example.novel.db
+
+import android.content.Context
+import android.util.Log
+import org.json.JSONArray
+import java.io.File
+
+object JsonMigrator {
+    private const val TAG = "JsonMigrator"
+    private val CANDIDATES = listOf("novel_data.json", "books.json")
+
+    fun migrateIfNeeded(context: Context) {
+        val dir = context.filesDir
+        val oldFile = CANDIDATES.map { File(dir, it) }.firstOrNull { it.exists() }
+        if (oldFile == null) return
+
+        val dao = BookDao(context)
+        if (!dao.isEmpty()) return
+
+        try {
+            val text = oldFile.readText(Charsets.UTF_8).trim()
+            if (text.isEmpty()) return
+            val arr = JSONArray(text)
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val id = o.optString("id").trim()
+                val title = o.optString("title").trim()
+                if (id.isEmpty() || title.isEmpty()) continue
+                val isShort = (o.optString("type").trim() == "鐭瘒")
+                val content = o.optString("content")
+                val wordCount = content.replace("\\s".toRegex(), "").length
+                val hash = content.hashCode().toString(16)
+                val updatedAt = id.toLongOrNull() ?: System.currentTimeMillis()
+                dao.addBookWithId(id, title, isShort, wordCount, updatedAt, hash)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "杩佺Щ澶辫触", e)
+        }
+    }
+}
